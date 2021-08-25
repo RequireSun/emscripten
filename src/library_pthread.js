@@ -470,6 +470,33 @@ var LibraryPThread = {
     }
   },
 
+  $registerTlsInit: function(moduleExports, metadata) {
+    var emscripten_tls_init = moduleExports['emscripten_tls_init'];
+    assert(emscripten_tls_init);
+#if DYLINK_DEBUG
+    out("adding to tlsInitFunctions: " + emscripten_tls_init);
+#endif
+#if RELOCATABLE
+    function tlsInint() {
+      var __tls_base = emscripten_tls_init();
+#if DYLINK_DEBUG
+      err('tlsInint -> ' + __tls_base);
+#endif
+      for (var sym in metadata.tlsExports) {
+        metadata.tlsExports[sym] = moduleExports[sym];
+      }
+      relocateExports(metadata.tlsExports, __tls_base, true);
+    }
+
+    PThread.tlsInitFunctions.push(tlsInint);
+    if (runtimeInitialized) {
+      tlsInint();
+    }
+#else
+    PThread.tlsInitFunctions.push(emscripten_tls_init);
+#endif
+  },
+
   $cancelThread: function(pthread_ptr) {
     if (ENVIRONMENT_IS_PTHREAD) throw 'Internal Error! cancelThread() can only ever be called from main application thread!';
     if (!pthread_ptr) throw 'Internal Error! Null pthread_ptr in cancelThread!';

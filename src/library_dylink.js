@@ -68,7 +68,7 @@ var LibraryDylink = {
   },
 
   $updateGOT__deps: ['$GOT', '$isInternalSym'],
-  $updateGOT: function(exports) {
+  $updateGOT: function(exports, replace) {
 #if DYLINK_DEBUG
     err("updateGOT: " + Object.keys(exports).length);
 #endif
@@ -77,7 +77,6 @@ var LibraryDylink = {
         continue;
       }
 
-      var replace = false;
       var value = exports[symName];
 #if !WASM_BIGINT
       if (symName.startsWith('orig$')) {
@@ -117,7 +116,7 @@ var LibraryDylink = {
 
   // Applies relocations to exported things.
   $relocateExports__deps: ['$updateGOT'],
-  $relocateExports: function(exports, memoryBase) {
+  $relocateExports: function(exports, memoryBase, replace) {
     var relocated = {};
 
     for (var e in exports) {
@@ -139,7 +138,7 @@ var LibraryDylink = {
       }
       relocated[e] = value;
     }
-    updateGOT(relocated);
+    updateGOT(relocated, replace);
     return relocated;
   },
 
@@ -256,12 +255,18 @@ var LibraryDylink = {
   // returns the side module metadata as an object
   // { memorySize, memoryAlign, tableSize, tableAlign, neededDynlibs}
   $getDylinkMetadata: function(binary) {
-    var next = 0;
+    var offset = 0;
+    var end = 0;
+
+    function getU8() {
+      return binary[offset++];
+    }
+
     function getLEB() {
       var ret = 0;
       var mul = 1;
       while (1) {
-        var byte = binary[next++];
+        var byte = binary[offset++];
         ret += ((byte & 0x7f) * mul);
         mul *= 0x80;
         if (!(byte & 0x80)) break;
@@ -269,24 +274,27 @@ var LibraryDylink = {
       return ret;
     }
 
+    function getString() {
+      var len = getLEB();
+      offset += len;
+      return UTF8ArrayToString(binary, offset - len, len);
+    }
+
     if (binary instanceof WebAssembly.Module) {
       var dylinkSection = WebAssembly.Module.customSections(binary, "dylink");
       assert(dylinkSection.length != 0, 'need dylink section');
       binary = new Uint8Array(dylinkSection[0]);
+      end = binary.length
     } else {
       var int32View = new Uint32Array(new Uint8Array(binary.subarray(0, 24)).buffer);
       assert(int32View[0] == 0x6d736100, 'need to see wasm magic number'); // \0asm
       // we should see the dylink section right after the magic number and wasm version
       assert(binary[8] === 0, 'need the dylink section to be first')
-      next = 9;
-      getLEB(); //section size
-      assert(binary[next] === 6);                 next++; // size of "dylink" string
-      assert(binary[next] === 'd'.charCodeAt(0)); next++;
-      assert(binary[next] === 'y'.charCodeAt(0)); next++;
-      assert(binary[next] === 'l'.charCodeAt(0)); next++;
-      assert(binary[next] === 'i'.charCodeAt(0)); next++;
-      assert(binary[next] === 'n'.charCodeAt(0)); next++;
-      assert(binary[next] === 'k'.charCodeAt(0)); next++;
+      offset = 9;
+      var section_size = getLEB(); //section size
+      end = offset + section_size;
+      var name = getString();
+      assert(name == 'dylink');
     }
 
     var customSection = {};
@@ -304,12 +312,38 @@ var LibraryDylink = {
     var neededDynlibsCount = getLEB();
     customSection.neededDynlibs = [];
     for (var i = 0; i < neededDynlibsCount; ++i) {
-      var nameLen = getLEB();
-      var nameUTF8 = binary.subarray(next, next + nameLen);
-      next += nameLen;
-      var name = UTF8ArrayToString(nameUTF8, 0);
+      var name = getString();
       customSection.neededDynlibs.push(name);
     }
+
+#if DYLINK_DEBUG
+    err('dylink needed:' + customSection.neededDynlibs);
+#endif
+    customSection.tlsExports = {};
+
+    var WASM_DYLINK_EXPORT_INFO = 0x1;
+    var WASM_DYLINK_IMPORT_INFO = 0x2;
+    var WASM_SYMBOL_TLS = 0x100;
+
+    while (offset < end) {
+      var subsectionType = getU8();
+      var subsectionSize = getLEB();
+      if (subsectionType === WASM_DYLINK_EXPORT_INFO) {
+        var count = getLEB();
+        while (count--) {
+          var name = getString();
+          var flags = getLEB();
+          if (flags & WASM_SYMBOL_TLS) {
+            customSection.tlsExports[name] = 1;
+          }
+        }
+      } else {
+        err('unknown subsection: ' + subsectionType)
+        // unknown subsection
+        offset += subsectionSize;
+      }
+    }
+    assert(offset == end);
     return customSection;
   },
 
@@ -485,17 +519,7 @@ var LibraryDylink = {
 #if USE_PTHREADS
         // Only one thread (currently The main thread) should call
         // __wasm_call_ctors, but all threads need to call emscripten_tls_init
-        var initTLS = moduleExports['emscripten_tls_init'];
-#if ASSERTIONS
-        assert(initTLS);
-#endif
-#if DYLINK_DEBUG
-        out("adding to tlsInitFunctions: " + initTLS);
-#endif
-        PThread.tlsInitFunctions.push(initTLS);
-        if (runtimeInitialized) {
-          initTLS();
-        }
+        registerTlsInit(instance.exports, metadata)
         if (!ENVIRONMENT_IS_PTHREAD) {
 #endif
           var init = moduleExports['__wasm_call_ctors'];
